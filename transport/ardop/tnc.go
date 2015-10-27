@@ -18,14 +18,6 @@ import (
 	"github.com/la5nta/wl2k-go/transport"
 )
 
-const DefaultARQTimeout = 90 * time.Second
-
-var (
-	ErrBusy              = errors.New("TNC control port is busy.")
-	ErrConnectInProgress = errors.New("A connect is in progress.")
-	ErrFlushTimeout      = errors.New("Flush timeout.")
-)
-
 type TNC struct {
 	ctrl io.ReadWriteCloser
 	data *tncConn
@@ -38,6 +30,7 @@ type TNC struct {
 	busy bool
 
 	state State
+	heard map[string]time.Time
 
 	selfClose bool
 
@@ -45,6 +38,7 @@ type TNC struct {
 
 	connected      bool
 	listenerActive bool
+	closed         bool
 }
 
 // OpenTCP opens and initializes an ardop TNC over TCP.
@@ -65,6 +59,7 @@ func Open(conn io.ReadWriteCloser, mycall, gridSquare string) (*TNC, error) {
 		in:     newBroadcaster(),
 		dataIn: make(chan []byte, 4096),
 		ctrl:   conn,
+		heard:  make(map[string]time.Time),
 	}
 
 	if err := tnc.runControlLoop(); err == io.EOF {
@@ -132,8 +127,6 @@ func (tnc *TNC) init() (err error) {
 	return nil
 }
 
-var ErrChecksumMismatch = fmt.Errorf("Control protocol checksum mismatch")
-
 func (tnc *TNC) runControlLoop() error {
 	rd := bufio.NewReader(tnc.ctrl)
 
@@ -155,6 +148,9 @@ func (tnc *TNC) runControlLoop() error {
 	go func() {
 		for { // Handle incoming TNC data
 			frame, err := readFrame(rd)
+			if err == io.EOF {
+				break
+			}
 			if err != nil {
 				if debugEnabled() {
 					log.Println("Error reading frame: %s", err)
@@ -169,25 +165,34 @@ func (tnc *TNC) runControlLoop() error {
 			}
 
 			if d, ok := frame.(dFrame); ok {
-				if d.ARQFrame() {
-					tnc.out <- string(cmdReady) // CRC ok
-
+				switch {
+				case d.ARQFrame():
 					select {
 					case tnc.dataIn <- d.data:
 					case <-time.After(time.Minute):
 						go tnc.Disconnect() // Buffer full and timeout
 					}
+				case d.IDFrame():
+					call, _, err := parseIDFrame(d)
+					if err == nil {
+						tnc.heard[call] = time.Now()
+					} else if debugEnabled() {
+						log.Println(err)
+					}
 				}
-
-				continue
 			}
 
 			line, ok := frame.(cmdFrame)
 			if !ok {
-				continue // TODO: Handle IDF frame
+				tnc.out <- string(cmdReady) // CRC ok
+				continue
 			}
 
 			msg := line.Parsed()
+
+			if msg.cmd != cmdReady {
+				tnc.out <- string(cmdReady) // CRC ok
+			}
 
 			switch msg.cmd {
 			case cmdPTT:
@@ -216,8 +221,7 @@ func (tnc *TNC) runControlLoop() error {
 			tnc.in.Send(msg)
 		}
 
-		tnc.in.Close()
-		close(tnc.out)
+		tnc.close()
 	}()
 
 	out := make(chan string)
@@ -273,6 +277,10 @@ func (tnc *TNC) eof() {
 //
 // This will not actually close the TNC software.
 func (tnc *TNC) Close() error {
+	if tnc.closed {
+		return nil
+	}
+
 	if err := tnc.SetListenEnabled(false); err != nil {
 		return err
 	}
@@ -281,15 +289,26 @@ func (tnc *TNC) Close() error {
 		return err
 	}
 
+	tnc.close()
+	return nil
+}
+
+func (tnc *TNC) close() {
+	if tnc.closed {
+		return
+	}
+
+	tnc.eof()
+
 	tnc.ctrl.Close()
 
+	tnc.in.Close()
 	close(tnc.out)
 	close(tnc.dataOut)
+	tnc.closed = true
 
 	// no need for a finalizer anymore
 	runtime.SetFinalizer(tnc, nil)
-
-	return nil
 }
 
 // Returns true if channel is clear
@@ -353,6 +372,42 @@ func (tnc *TNC) SetMycall(mycall string) error {
 	return tnc.set(cmdMyCall, mycall)
 }
 
+// SetCWID sets wether or not to send FSK CW ID after an ID frame.
+func (tnc *TNC) SetCWID(enabled bool) error {
+	return tnc.set(cmdCWID, enabled)
+}
+
+// CWID reports wether or not the TNC will send FSK CW ID after an ID frame.
+func (tnc *TNC) CWID() (bool, error) {
+	return tnc.getBool(cmdCWID)
+}
+
+// SendID will send an ID frame
+//
+// If CWID is enabled the ID frame will be followed by a FSK CW ID.
+func (tnc *TNC) SendID() error {
+	return tnc.set(cmdSendID, nil)
+}
+
+// BeaconEvery starts a goroutine that sends an ID frame (SendID) at the regular interval d
+//
+// The gorutine will be closed on Close().
+func (tnc *TNC) BeaconEvery(d time.Duration) error {
+	if err := tnc.SendID(); err != nil {
+		return err
+	}
+
+	go func() {
+		for _ = range time.Tick(d) {
+			if tnc.closed {
+				return
+			}
+			tnc.SendID()
+		}
+	}()
+	return nil
+}
+
 // Sets the auxiliary call signs that the TNC should answer to on incoming connections.
 func (tnc *TNC) SetAuxiliaryCalls(calls []string) (err error) {
 	return tnc.set(cmdMyAux, strings.Join(calls, ", "))
@@ -370,6 +425,11 @@ func (tnc *TNC) SetCodec(state bool) error {
 func (tnc *TNC) ListenEnabled() StateReceiver {
 	return tnc.in.ListenState()
 }
+
+// Heard returns all stations heard by the TNC since it was opened.
+//
+// The returned map is a map from callsign to last time the station was heard.
+func (tnc *TNC) Heard() map[string]time.Time { return tnc.heard }
 
 // Enable/disable TNC response to an ARQ connect request.
 //
@@ -448,7 +508,11 @@ func (tnc *TNC) arqCall(targetcall string, repeat int) error {
 	return nil
 }
 
-func (tnc *TNC) set(cmd Command, param interface{}) (err error) {
+func (tnc *TNC) set(cmd command, param interface{}) (err error) {
+	if tnc.closed {
+		return ErrTNCClosed
+	}
+
 	r := tnc.in.Listen()
 	defer r.Close()
 
@@ -468,7 +532,7 @@ func (tnc *TNC) set(cmd Command, param interface{}) (err error) {
 	return errors.New("TNC hung up")
 }
 
-func (tnc *TNC) getString(cmd Command) (string, error) {
+func (tnc *TNC) getString(cmd command) (string, error) {
 	v, err := tnc.get(cmd)
 	if err != nil {
 		return "", nil
@@ -476,7 +540,7 @@ func (tnc *TNC) getString(cmd Command) (string, error) {
 	return v.(string), nil
 }
 
-func (tnc *TNC) getBool(cmd Command) (bool, error) {
+func (tnc *TNC) getBool(cmd command) (bool, error) {
 	v, err := tnc.get(cmd)
 	if err != nil {
 		return false, nil
@@ -484,7 +548,7 @@ func (tnc *TNC) getBool(cmd Command) (bool, error) {
 	return v.(bool), nil
 }
 
-func (tnc *TNC) getInt(cmd Command) (int, error) {
+func (tnc *TNC) getInt(cmd command) (int, error) {
 	v, err := tnc.get(cmd)
 	if err != nil {
 		return 0, err
@@ -492,7 +556,11 @@ func (tnc *TNC) getInt(cmd Command) (int, error) {
 	return v.(int), nil
 }
 
-func (tnc *TNC) get(cmd Command) (value interface{}, err error) {
+func (tnc *TNC) get(cmd command) (value interface{}, err error) {
+	if tnc.closed {
+		return nil, ErrTNCClosed
+	}
+
 	r := tnc.in.Listen()
 	defer r.Close()
 

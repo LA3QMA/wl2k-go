@@ -100,6 +100,12 @@ type ArdopConfig struct {
 
 	// Set to true if hamlib should control PTT (SignaLink=false, most rigexpert=true).
 	PTTControl bool `json:"ptt_ctrl"`
+
+	// (optional) Send ID frame at a regular interval when the listener is active (unit is seconds)
+	BeaconInterval int `json:"beacon_interval"`
+
+	// Send FSK CW ID after an ID frame.
+	CWID bool `json:"cwid_enabled"`
 }
 
 type TelnetConfig struct {
@@ -164,6 +170,7 @@ var DefaultConfig Config = Config{
 	Ardop: ArdopConfig{
 		Addr:         "localhost:8515",
 		ARQBandwidth: ardop.Bandwidth500Max,
+		CWID:         true,
 	},
 	Telnet: TelnetConfig{
 		ListenAddr: ":8774",
